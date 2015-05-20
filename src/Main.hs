@@ -4,7 +4,7 @@ import Data.Aeson
 import Data.Aeson.Types
 import System.Process (runCommand, ProcessHandle)
 import Control.Concurrent (threadDelay)
-import System.Environment (getEnv)
+import System.Directory
 import qualified Data.ByteString.Lazy as B
 import qualified Data.Text as T
 import Network.HTTP.Conduit (simpleHttp)
@@ -13,10 +13,19 @@ import Control.Monad
 import System.IO (openTempFile, hPutStr, hGetContents)
 
 notify :: String -> String -> IO ProcessHandle
-notify title msg = runCommand $ "notify-send " ++ quotify title ++ ' ':(quotify msg)
+notify title msg = runCommand $ "notify-send " ++ readify title ++ ' ':(readify msg)
   where
+  readify :: String -> String
+  readify = quotify . escapify
+  escapify :: String -> String
+  escapify = foldr acc ""
+    where
+    acc :: Char -> String -> String
+    acc c str
+      | c == '"' = '\\':'"':str
+      | otherwise = c:str
   quotify :: String -> String
-  quotify str = '\'' : str ++ "'"
+  quotify str = '"' : str ++ "\""
 
 findLineInCfg :: String -> String -> String
 findLineInCfg key = value . head . filter findLine . lines
@@ -72,18 +81,31 @@ filterMessages :: [Message] -> [String] -> [Message]
 filterMessages msgs oldIds = filter (\m -> (T.unpack $ theId m) `notElem` oldIds) msgs
 
 main = do
-  home <- getEnv "HOME"
+  home <- getHomeDirectory
   config <- readFile (home ++ "/.config/snootify.conf")
   let rssAddr = findLineInCfg "rss-address" config
       delayInSeconds = 1000000 * (read $ findLineInCfg "repeat-interval" config)
-  messages <- simpleHttp rssAddr
-  theLoop rssAddr delayInSeconds []
-    where
-    theLoop rss delay oldIds = do
-      msgs <- simpleHttp rss
-      mapM (\(title,body) -> notify title body) . map notificationFromMessage $ filterMessages (getMessages msgs) oldIds
-      if delay > 0
-        then do
-          threadDelay delay
-          theLoop rss delay (map (T.unpack . theId) $ getMessages msgs)
-        else return ()
+  if delayInSeconds < 1
+  then oneTimeLookup rssAddr
+  else repeatLookup rssAddr delayInSeconds []
+
+-- delay is improper, i.e. < 1 second
+oneTimeLookup :: String -> IO ()
+oneTimeLookup rss = do
+  let tmpFile = "/tmp/snootifytmp"
+  msgs <- simpleHttp rss
+  oldIdsExist <- doesFileExist tmpFile
+  oldIds <- if oldIdsExist
+            then readFile tmpFile
+            else return []
+  notifyNewMessages msgs (lines oldIds)
+  writeFile tmpFile (unlines . map (T.unpack . theId) $ getMessages msgs)
+-- delay is proper, i.e. >= 1 second
+repeatLookup :: String -> Int -> [String] -> IO ()
+repeatLookup rss delay oldIds = do
+  msgs <- simpleHttp rss
+  notifyNewMessages msgs oldIds
+  threadDelay delay
+  repeatLookup rss delay (map (T.unpack . theId) $ getMessages msgs)
+notifyNewMessages :: B.ByteString -> [String] -> IO [ProcessHandle]
+notifyNewMessages new old = mapM (\(title,body) -> notify title body) . map notificationFromMessage $ filterMessages (getMessages new) old
